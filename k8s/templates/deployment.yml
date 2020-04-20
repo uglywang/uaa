@@ -1,5 +1,11 @@
 #@ load("@ytt:data", "data")
-#@ load("deployment.star", "java_opts", "config_dir", "secrets_dir")
+#@ load("deployment.star",
+#@  "java_opts",
+#@  "config_dir",
+#@  "secrets_dir",
+#@  "truststore_file")
+#@ load("secrets/ca_certs.star", "has_ca_certs")
+
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -16,6 +22,62 @@ spec:
         app: uaa-deployment
     spec: #! pod spec
       serviceAccountName: uaa
+#@ if has_ca_certs(data.values.ca_certs):
+      initContainers:
+      - name: build-uaa-truststore
+        image: openjdk:11
+        command:
+        - 'sh'
+        - '-c'
+        - |
+          import_cert() {
+            local truststore_path="${1}"
+            local pemfile="${2}"
+            local alias="${3}"
+
+            "${JAVA_HOME}"/bin/keytool \
+              -noprompt \
+              -import \
+              -file "${pemfile}" \
+              -trustcacerts \
+              -alias "${alias}" \
+              -keystore "${truststore_path}" \
+              -storepass changeit
+          }
+
+          get_alias() {
+            basename "${1}" .pem
+          }
+
+          build_truststore() {
+            local truststore_path="${1}"
+
+            for cert in $SECRETS_DIR/ca_certs/*.pem; do
+              local alias="$(get_alias $cert)"
+              import_cert "${truststore_path}" "${cert}" "${alias}"
+            done
+          }
+
+          main() {
+            local truststore_path="$(mktemp -d)/temp-truststore"
+
+            build_truststore "${truststore_path}"
+            cp "${truststore_path}" "${TRUSTSTORE_FILE}"
+          }
+
+          main
+        env:
+        - name: SECRETS_DIR
+          value: #@ secrets_dir
+        - name: TRUSTSTORE_FILE
+          value: #@ truststore_file
+        volumeMounts:
+        - name: ca-certs-files
+          mountPath: #@ "{}/ca_certs".format(secrets_dir)
+          readOnly: true
+        - name: truststore-file
+          mountPath: /etc/truststore
+#@ end
       containers:
       - name: uaa
         image: #@ data.values.image
@@ -51,6 +113,11 @@ spec:
           mountPath: #@ "{}/jwt_policy_signing_keys.yml".format(secrets_dir)
           subPath: jwt_policy_signing_keys.yml
           readOnly: true
+#@ if has_ca_certs(data.values.ca_certs):
+        - name: truststore-file
+          mountPath: /etc/truststore
+          readOnly: true
+#@ end
         livenessProbe:
           httpGet:
             path: /healthz
@@ -80,3 +147,11 @@ spec:
       - name: jwt-policy-signing-keys-file
         secret:
           secretName: uaa-jwt-policy-signing-keys
+#@ if has_ca_certs(data.values.ca_certs):
+      - name: ca-certs-files
+        secret:
+          optional: true
+          secretName: uaa-ca-certs
+      - name: truststore-file
+        emptyDir: {}
+#@ end
